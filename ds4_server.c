@@ -376,6 +376,52 @@ static bool json_raw_value(const char **p, char **out) {
     return true;
 }
 
+/* Parse an OpenAI/DeepSeek response_format value such as {"type":"json_object"}.
+ * Sets *json_mode true only for type "json_object"; "text", null, and other
+ * shapes are consumed and leave it false.  This implements the DeepSeek JSON
+ * Output contract (guaranteed-valid JSON), not full json_schema enforcement. */
+static bool parse_response_format(const char **pp, bool *json_mode) {
+    const char *p = *pp;
+    json_ws(&p);
+    if (*p != '{') {                 /* null or unexpected: ignore, stay false */
+        if (!json_skip_value(&p)) return false;
+        *pp = p;
+        return true;
+    }
+    p++;
+    json_ws(&p);
+    if (*p == '}') { p++; *pp = p; return true; }
+    for (;;) {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;   /* json_string skips leading ws */
+        json_ws(&p);
+        if (*p != ':') { free(key); return false; }
+        p++;
+        if (!strcmp(key, "type")) {
+            char *type = NULL;
+            if (json_string(&p, &type)) {
+                if (!strcmp(type, "json_object")) *json_mode = true;
+                free(type);
+            } else if (!json_skip_value(&p)) {       /* non-string type: tolerate */
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(&p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(&p);
+        if (*p == ',') { p++; continue; }
+        break;
+    }
+    json_ws(&p);
+    if (*p != '}') return false;
+    p++;
+    *pp = p;
+    return true;
+}
+
 static char *json_minify_raw_value(const char *json) {
     const char *p = json ? json : "null";
     json_ws(&p);
@@ -603,6 +649,10 @@ typedef struct {
     int cache_write_tokens;
     ds4_think_mode think_mode;
     bool has_tools;
+    /* response_format={"type":"json_object"}: constrain the visible answer (the
+     * text after </think>, or the whole reply when thinking is off) to exactly
+     * one syntactically valid JSON value via logit masking during decode. */
+    bool json_mode;
     bool prompt_preserves_reasoning;
     /* For /v1/responses: emit reasoning_summary_* events / fields only when the
      * client opted in via reasoning.summary. Other APIs leave this false; the
@@ -2749,6 +2799,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "response_format")) {
+            if (!parse_response_format(&p, &r->json_mode)) {
+                free(key);
+                goto bad;
+            }
         } else if (!json_skip_value(&p)) {
             free(key);
             goto bad;
@@ -3816,6 +3871,13 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "response_format")) {
+            /* DeepSeek exposes JSON mode only through response_format; accept the
+             * same field here rather than the OpenAI Responses text.format shape. */
+            if (!parse_response_format(&p, &r->json_mode)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "reasoning")) {
             bool effort_seen = false;
             if (!parse_responses_reasoning(&p, &reasoning_effort,
@@ -4077,6 +4139,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             got_thinking = true;
         } else if (!strcmp(key, "stop")) {
             if (!parse_stop(&p, &r->stops)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "response_format")) {
+            if (!parse_response_format(&p, &r->json_mode)) {
                 free(key);
                 goto bad;
             }
@@ -9975,6 +10042,269 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+/* ---------------------------------------------------------------------------
+ * JSON-mode constrained decoding (response_format={"type":"json_object"}).
+ *
+ * A small incremental JSON validator tracks whether the bytes emitted so far
+ * form a valid prefix of exactly one JSON value, and whether that value is
+ * already complete.  It is used two ways during decode:
+ *   - advance: fold the accepted token's bytes into the live validator.
+ *   - probe:   copy the live validator (it is a flat POD), feed a candidate
+ *              token's bytes, and keep the token only if it stays valid.
+ * The probe runs over the whole vocabulary each step to mask the logits, so it
+ * must be allocation-free: token bytes and special flags are precomputed once
+ * into a process-wide table.  This trades a few ms/token for a hard guarantee
+ * of well-formed output; it is only paid when JSON mode is active.
+ * ------------------------------------------------------------------------- */
+
+#define JSON_MAX_DEPTH 64
+
+enum { JX_VAL, JX_VAL_FIRST, JX_KEY, JX_KEY_FIRST, JX_COLON, JX_AFTER };
+enum { JL_NONE, JL_STR, JL_NUM, JL_LIT };
+/* number sub-states; terminal ones may legally end the number */
+enum { JN_MINUS, JN_ZERO, JN_INT, JN_DOT, JN_FRAC, JN_EXP, JN_EXPSIGN, JN_EXPDIG };
+
+typedef struct {
+    unsigned char stack[JSON_MAX_DEPTH]; /* 0 = object, 1 = array */
+    int depth;
+    unsigned char expect;   /* JX_* */
+    unsigned char lex;      /* JL_* */
+    unsigned char strst;    /* 0 normal, 1 after backslash, 2..5 unicode hex */
+    unsigned char u8_cont;  /* UTF-8 continuation bytes still expected in a string */
+    unsigned char numst;    /* JN_* */
+    unsigned char litpos;   /* index into the matched literal */
+    const char *lit;        /* "true" / "false" / "null" while lexing a literal */
+    bool done;              /* a complete top-level value has been read */
+    bool error;
+} json_validator;
+
+static void json_validator_init(json_validator *v) {
+    memset(v, 0, sizeof(*v));
+    v->expect = JX_VAL;
+    v->lex = JL_NONE;
+}
+
+static bool json_num_terminal(unsigned char numst) {
+    return numst == JN_ZERO || numst == JN_INT || numst == JN_FRAC ||
+           numst == JN_EXPDIG;
+}
+
+/* Close the value just completed: return to the enclosing container's "after"
+ * position, or mark the whole document done at depth 0. */
+static void json_complete_value(json_validator *v) {
+    v->lex = JL_NONE;
+    if (v->depth == 0) v->done = true;
+    else v->expect = JX_AFTER;
+}
+
+static bool json_is_ws(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+/* Feed one byte.  Returns true when a number just closed on a delimiter byte
+ * that the caller must re-handle once in the now-current state. */
+static bool json_step(json_validator *v, unsigned char c) {
+    if (v->error) return false;
+    if (v->done) {                       /* only trailing whitespace allowed */
+        if (!json_is_ws(c)) v->error = true;
+        return false;
+    }
+    switch (v->lex) {
+    case JL_STR:
+        if (v->strst == 1) {             /* escape */
+            if (c == '"' || c == '\\' || c == '/' || c == 'b' || c == 'f' ||
+                c == 'n' || c == 'r' || c == 't') v->strst = 0;
+            else if (c == 'u') v->strst = 2;
+            else v->error = true;
+        } else if (v->strst >= 2) {      /* 4 hex digits of \uXXXX */
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                       (c >= 'A' && c <= 'F');
+            if (!hex) v->error = true;
+            else if (v->strst == 5) v->strst = 0;
+            else v->strst++;
+        } else if (v->u8_cont) {         /* mid UTF-8 sequence: expect 10xxxxxx */
+            if (c < 0x80 || c > 0xBF) v->error = true;
+            else v->u8_cont--;
+        } else {                         /* string body, between code points */
+            if (c == '"') {
+                v->lex = JL_NONE;        /* leave the string before dispatching */
+                if (v->expect == JX_KEY || v->expect == JX_KEY_FIRST)
+                    v->expect = JX_COLON;
+                else
+                    json_complete_value(v);
+            } else if (c == '\\') v->strst = 1;
+            else if (c < 0x20) v->error = true;   /* unescaped control */
+            else if (c >= 0x80) {                 /* UTF-8 lead byte; JSON text is UTF-8 */
+                if (c < 0xC2 || c > 0xF4) v->error = true;  /* lone/overlong/invalid lead */
+                else if (c < 0xE0) v->u8_cont = 1;
+                else if (c < 0xF0) v->u8_cont = 2;
+                else v->u8_cont = 3;
+            }
+        }
+        return false;
+    case JL_NUM: {
+        unsigned char ns = v->numst;
+        bool extend = false;
+        if (c >= '0' && c <= '9') {
+            switch (ns) {
+            case JN_MINUS: v->numst = (c == '0') ? JN_ZERO : JN_INT; extend = true; break;
+            case JN_INT: case JN_FRAC: extend = true; break;
+            case JN_DOT: v->numst = JN_FRAC; extend = true; break;
+            case JN_EXP: case JN_EXPSIGN: v->numst = JN_EXPDIG; extend = true; break;
+            case JN_EXPDIG: extend = true; break;
+            default: break;              /* JN_ZERO: 00 is invalid */
+            }
+        } else if (c == '.' && (ns == JN_ZERO || ns == JN_INT)) {
+            v->numst = JN_DOT; extend = true;
+        } else if ((c == 'e' || c == 'E') &&
+                   (ns == JN_ZERO || ns == JN_INT || ns == JN_FRAC)) {
+            v->numst = JN_EXP; extend = true;
+        } else if ((c == '+' || c == '-') && ns == JN_EXP) {
+            v->numst = JN_EXPSIGN; extend = true;
+        }
+        if (extend) return false;
+        if (json_num_terminal(ns)) {     /* number ended; re-handle the delimiter */
+            json_complete_value(v);
+            return true;
+        }
+        v->error = true;
+        return false;
+    }
+    case JL_LIT:
+        if (c == (unsigned char)v->lit[v->litpos]) {
+            v->litpos++;
+            if (v->lit[v->litpos] == '\0') json_complete_value(v);
+        } else {
+            v->error = true;
+        }
+        return false;
+    default: break;
+    }
+
+    /* lex == JL_NONE: dispatch on what the grammar expects next. */
+    if (json_is_ws(c)) return false;
+    switch (v->expect) {
+    case JX_VAL:
+    case JX_VAL_FIRST:
+        if (v->expect == JX_VAL_FIRST && c == ']') {
+            v->depth--; json_complete_value(v); return false;
+        }
+        if (c == '{') {
+            if (v->depth >= JSON_MAX_DEPTH) { v->error = true; return false; }
+            v->stack[v->depth++] = 0; v->expect = JX_KEY_FIRST;
+        } else if (c == '[') {
+            if (v->depth >= JSON_MAX_DEPTH) { v->error = true; return false; }
+            v->stack[v->depth++] = 1; v->expect = JX_VAL_FIRST;
+        } else if (c == '"') {
+            v->lex = JL_STR; v->strst = 0;
+        } else if (c == '-' || (c >= '0' && c <= '9')) {
+            v->lex = JL_NUM;
+            v->numst = (c == '-') ? JN_MINUS : (c == '0') ? JN_ZERO : JN_INT;
+        } else if (c == 't') { v->lex = JL_LIT; v->lit = "true"; v->litpos = 1; }
+        else if (c == 'f') { v->lex = JL_LIT; v->lit = "false"; v->litpos = 1; }
+        else if (c == 'n') { v->lex = JL_LIT; v->lit = "null"; v->litpos = 1; }
+        else v->error = true;
+        return false;
+    case JX_KEY:
+    case JX_KEY_FIRST:
+        if (v->expect == JX_KEY_FIRST && c == '}') {
+            v->depth--; json_complete_value(v);
+        } else if (c == '"') {
+            v->lex = JL_STR; v->strst = 0;
+        } else v->error = true;
+        return false;
+    case JX_COLON:
+        if (c == ':') v->expect = JX_VAL; else v->error = true;
+        return false;
+    case JX_AFTER:
+        if (c == ',') {
+            v->expect = v->stack[v->depth - 1] == 0 ? JX_KEY : JX_VAL;
+        } else if (c == '}' && v->stack[v->depth - 1] == 0) {
+            v->depth--; json_complete_value(v);
+        } else if (c == ']' && v->stack[v->depth - 1] == 1) {
+            v->depth--; json_complete_value(v);
+        } else v->error = true;
+        return false;
+    }
+    return false;
+}
+
+/* Feed a byte run; returns false (and leaves error set) on the first invalid
+ * byte.  Bytes after a completed top-level value are valid only if whitespace. */
+static bool json_validator_feed(json_validator *v, const char *bytes, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)bytes[i];
+        if (json_step(v, c)) json_step(v, c);  /* a closed number re-handles its delimiter once */
+        if (v->error) return false;
+    }
+    return true;
+}
+
+/* True when the model may legally emit EOS now: a complete document, or a
+ * top-level number sitting in a state that ends a valid number. */
+static bool json_validator_completable(const json_validator *v) {
+    if (v->error) return false;
+    if (v->done) return true;
+    return v->depth == 0 && v->lex == JL_NUM && json_num_terminal(v->numst);
+}
+
+typedef struct { char *bytes; int len; bool special; } json_tok;
+
+static pthread_mutex_t g_json_tok_lock = PTHREAD_MUTEX_INITIALIZER;
+static json_tok *g_json_tok = NULL;
+static int g_json_tok_n = 0;
+
+/* Build (once) and return the per-vocabulary token byte table.  ds4_token_text
+ * allocates, so we pay it a single time and keep the table for the process.
+ * It is a mutex-guarded file-scope global because the server runs one engine
+ * (one fixed vocab) per process; the table is built lazily and never freed.
+ * Callers resolve it once per request (at JSON-mode arming), not per token. */
+static const json_tok *json_tok_table(ds4_engine *e, int *n_out) {
+    pthread_mutex_lock(&g_json_tok_lock);
+    if (!g_json_tok) {
+        int nv = ds4_n_vocab(e);
+        json_tok *tab = xmalloc((size_t)nv * sizeof(*tab));
+        for (int t = 0; t < nv; t++) {
+            size_t len = 0;
+            tab[t].bytes = ds4_token_text(e, t, &len);
+            tab[t].len = (int)len;
+            tab[t].special = ds4_token_is_special(e, t);
+        }
+        g_json_tok = tab;
+        g_json_tok_n = nv;
+    }
+    pthread_mutex_unlock(&g_json_tok_lock);
+    *n_out = g_json_tok_n;
+    return g_json_tok;
+}
+
+/* Mask the live logits so only tokens that keep the output a valid JSON prefix
+ * remain samplable.  Special tokens are forbidden; EOS is allowed when the value
+ * can legally end, and also as a last resort when no other token can continue it
+ * so the model ends gracefully (DeepSeek returns partial/empty content rather
+ * than erroring) instead of being forced into an out-of-grammar pick.  tab/nv/eos
+ * are resolved once at arming; scratch holds nv floats.  Returns false if the
+ * mask could not be applied (caller should stop rather than sample unconstrained). */
+static bool json_constrain_logits(const json_tok *tab, int nv, int eos,
+                                  ds4_session *sess, const json_validator *v,
+                                  float *scratch) {
+    if (ds4_session_copy_logits(sess, scratch, nv) != nv) return false;
+    const bool can_finish = json_validator_completable(v);
+    const float BLOCK = -1e30f;
+    bool any_valid = false;
+    for (int t = 0; t < nv; t++) {
+        if (t == eos) continue;              /* EOS decided after the loop */
+        if (tab[t].special || tab[t].len == 0) { scratch[t] = BLOCK; continue; }
+        json_validator probe = *v;
+        if (json_validator_feed(&probe, tab[t].bytes, tab[t].len)) any_valid = true;
+        else scratch[t] = BLOCK;
+    }
+    /* Forbid a premature EOS only while the value is incomplete AND some token
+     * can still extend it; otherwise leave EOS samplable to terminate. */
+    if (!can_finish && any_valid) scratch[eos] = BLOCK;
+    return ds4_session_set_logits(sess, scratch, nv) == 0;
+}
+
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
@@ -10347,6 +10677,16 @@ decode_again:
     buf text = {0};
     size_t plain_stream_pos = 0;
     size_t stop_scan_from = 0;
+    /* JSON mode: armed once decoding leaves <think> (or immediately when
+     * thinking is off); from then on every sampled token is logit-masked to a
+     * valid JSON continuation and decoding stops at the complete value.  The
+     * token table, vocab size, eos, and scratch buffer are resolved once when
+     * arming, not per token. */
+    json_validator jval;
+    bool jval_armed = false;
+    float *json_scratch = NULL;
+    const json_tok *jtab = NULL;
+    int jtab_n = 0, jtab_eos = 0;
     const char *finish = "length";
     int completion = 0;
     int max_tokens = j->req.max_tokens;
@@ -10394,6 +10734,31 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
+        /* Arm JSON masking the first time we are outside <think>: for thinking
+         * requests this is right after </think>; with thinking off it is the
+         * first token.  Then mask the live logits before sampling.
+         *
+         * Skip masking when the request also carries tools.  DeepSeek's own
+         * tool-calling guidance states that with Tool Calling active "JSON mode
+         * constraints don't apply" (the tool schema owns the structure), and
+         * OpenAI's compatible API likewise neither rejects the combination nor
+         * blocks tool calls when response_format is set.  So tool-calling wins
+         * and json_object is best-effort here, rather than hard-masking the DSML
+         * tool-call markers (which would silently break tools). */
+        if (j->req.json_mode && !j->req.has_tools && !jval_armed && !thinking.inside) {
+            json_validator_init(&jval);
+            jtab = json_tok_table(s->engine, &jtab_n);
+            jtab_eos = ds4_token_eos(s->engine);
+            json_scratch = xmalloc((size_t)jtab_n * sizeof(float));
+            jval_armed = true;
+        }
+        if (jval_armed &&
+            !json_constrain_logits(jtab, jtab_n, jtab_eos, s->session, &jval, json_scratch)) {
+            /* Mask could not be applied (e.g. vocab-size mismatch): stop rather
+             * than emit unconstrained tokens. */
+            finish = "stop";
+            break;
+        }
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
@@ -10402,7 +10767,7 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f &&
+        if (temperature <= 0.0f && !jval_armed &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -10443,6 +10808,7 @@ decode_again:
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
             thinking_state_feed(&thinking, piece, piece_len);
+            if (jval_armed) json_validator_feed(&jval, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
             }
@@ -10613,9 +10979,23 @@ decode_again:
                 stop_decode = true;
                 break;
             }
+
+            /* JSON mode: stop once the masked stream completes a top-level value.
+             * jval.error is unreachable in normal operation (the mask only admits
+             * tokens that keep the prefix valid); if it ever fires we still stop
+             * with finish="stop" — DeepSeek returns partial content rather than a
+             * JSON-specific error finish_reason.  Text is untrimmed so the session
+             * KV stays consistent for reuse. */
+            if (jval_armed && (jval.done || jval.error)) {
+                finish = "stop";
+                stop_decode = true;
+                break;
+            }
         }
         if (stop_decode) break;
     }
+
+    free(json_scratch);
 
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
@@ -15616,7 +15996,83 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_json_validator(void) {
+    struct { const char *s; bool valid; bool done; } cases[] = {
+        {"{}", true, true},
+        {"[]", true, true},
+        {"{\"a\":1}", true, true},
+        {"{\"a\":1,\"b\":[true,null,-3.5e2],\"c\":\"x\\n y\"}", true, true},
+        {"\"hello\"", true, true},
+        {"true", true, true},
+        {"  \n {\"k\": [1, 2, 3]}  ", true, true},
+        {"{\"a\":1", true, false},   /* valid prefix, not yet complete */
+        {"[1,", true, false},
+        {"\"ab", true, false},
+        {"{\"a\":}", false, false},
+        {"{,}", false, false},
+        {"[1,]", false, false},
+        {"{'a':1}", false, false},
+        {"01", false, false},
+        {"{\"a\":1}x", false, false},
+        {"[1 2]", false, false},
+        {"\"caf\xc3\xa9\"", true, true},      /* valid 2-byte UTF-8 (e-acute) */
+        {"\"\xe2\x82\xac\"", true, true},     /* valid 3-byte UTF-8 (euro sign) */
+        {"\"\x80\"", false, false},           /* lone continuation byte */
+        {"\"\xc3\"", false, false},           /* truncated 2-byte sequence */
+        {"\"\xc3\x41\"", false, false},       /* bad continuation (0x41 not 10xxxxxx) */
+        {"\"\xff\"", false, false},           /* invalid lead byte */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        json_validator v;
+        json_validator_init(&v);
+        bool valid = json_validator_feed(&v, cases[i].s, strlen(cases[i].s));
+        TEST_ASSERT(valid == cases[i].valid);
+        if (valid) TEST_ASSERT(v.done == cases[i].done);
+    }
+
+    /* EOS is allowed only when the value can legally end. */
+    json_validator vn;
+    json_validator_init(&vn);
+    json_validator_feed(&vn, "42", 2);
+    TEST_ASSERT(json_validator_completable(&vn));     /* "42" is a complete value */
+    json_validator vf;
+    json_validator_init(&vf);
+    json_validator_feed(&vf, "4.", 2);
+    TEST_ASSERT(!json_validator_completable(&vf));    /* fraction needs a digit */
+    json_validator vl;
+    json_validator_init(&vl);
+    TEST_ASSERT(json_validator_feed(&vl, "nul", 3));  /* valid prefix of null */
+    TEST_ASSERT(!vl.error && !json_validator_completable(&vl));
+
+    /* Feeding one byte at a time must match feeding the whole string. */
+    const char *split = "{\"x\":[1,2,{\"y\":true}]}";
+    json_validator vs;
+    json_validator_init(&vs);
+    for (const char *c = split; *c; c++) TEST_ASSERT(json_validator_feed(&vs, c, 1));
+    TEST_ASSERT(vs.done && !vs.error);
+}
+
+static void test_response_format_parsing(void) {
+    struct { const char *body; bool expect; } cases[] = {
+        {"{\"type\":\"json_object\"}", true},
+        {"{\"type\": \"text\"}", false},
+        {"{\"type\":\"json_object\",\"extra\":1}", true},
+        {"null", false},
+        {"{}", false},
+        {"{\"type\":null}", false},        /* non-string type tolerated, not rejected */
+        {"{\"type\":123}", false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *p = cases[i].body;
+        bool json_mode = false;
+        TEST_ASSERT(parse_response_format(&p, &json_mode));
+        TEST_ASSERT(json_mode == cases[i].expect);
+    }
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_json_validator();
+    test_response_format_parsing();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();

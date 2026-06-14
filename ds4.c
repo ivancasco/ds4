@@ -21529,6 +21529,15 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
     return out;
 }
 
+int ds4_n_vocab(ds4_engine *e) {
+    return e ? (int)e->vocab.n_vocab : 0;
+}
+
+bool ds4_token_is_special(ds4_engine *e, int token) {
+    if (!e || token < 0 || token >= (int)e->vocab.n_vocab) return false;
+    return vocab_token_is_literal_special(e->vocab.token[token]);
+}
+
 int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
 }

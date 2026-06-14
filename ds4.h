@@ -216,6 +216,13 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len);
 int ds4_token_eos(ds4_engine *e);
 int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
+/* Vocabulary introspection used by constrained decoding (e.g. JSON mode): the
+ * count of token ids, and whether a token is a literal special marker that
+ * should not be emitted as text.  ds4_token_is_special matches DSML/control
+ * tokens carrying the fullwidth-bar delimiter (U+FF5C); plain ASCII control
+ * tokens such as <think>/</think> are not flagged here. */
+int ds4_n_vocab(ds4_engine *e);
+bool ds4_token_is_special(ds4_engine *e, int token);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
